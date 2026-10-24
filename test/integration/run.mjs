@@ -19,7 +19,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -30,7 +30,10 @@ const SPEC = join(HERE, 'agent-loop.spec.mjs');
 const ENTRY = join(REPO_ROOT, 'lib', 'index.js');
 
 const VERSION = process.env.DSH_TESTKIT_VERSION ?? '0.2.1-rc.2';
-const DEPS_DIR = process.env.DSH_TESTKIT_DEPS ?? join(tmpdir(), 'dsh-payload-guard-itest');
+// 目录名带上版本：否则切换 DSH_TESTKIT_VERSION 之后会复用上一个版本的依赖，
+// 出现「以为验证了 rc.3、实际跑的是 rc.2」的假验证。
+const DEPS_DIR =
+  process.env.DSH_TESTKIT_DEPS ?? join(tmpdir(), `dsh-payload-guard-itest-${VERSION}`);
 
 /** 集成测试直接用到、且必须版本一致的包。 */
 const PACKAGES = [
@@ -48,6 +51,18 @@ const PACKAGES = [
   `@deepseek-ai/dsh-compaction-image-offload@${VERSION}`,
 ];
 
+/** 读取已安装 testkit 的实际版本；缺失返回 undefined。 */
+function installedVersion() {
+  const marker = join(DEPS_DIR, 'node_modules', '@deepseek-ai', 'dsh-agent-loop-testkit');
+  const manifest = join(marker, 'package.json');
+  if (!existsSync(manifest)) return undefined;
+  try {
+    return JSON.parse(readFileSync(manifest, 'utf8')).version;
+  } catch {
+    return undefined;
+  }
+}
+
 function ensureDeps() {
   mkdirSync(DEPS_DIR, { recursive: true });
   const marker = join(DEPS_DIR, 'node_modules', '@deepseek-ai', 'dsh-agent-loop-testkit');
@@ -58,31 +73,39 @@ function ensureDeps() {
       JSON.stringify({ name: 'dsh-payload-guard-itest', private: true, type: 'module' }, null, 2),
     );
   }
-  if (process.env.SKIP_INSTALL === '1' && existsSync(marker)) {
-    console.log(`复用已安装依赖: ${DEPS_DIR}`);
+
+  // 已装版本的核验优先于「目录存在」：目录存在不代表装的是目标版本。
+  // 手动指定 DSH_TESTKIT_DEPS 时，这是唯一能发现版本错配的地方。
+  const present = installedVersion();
+  if (present !== undefined) {
+    if (present !== VERSION) {
+      throw new Error(
+        `依赖目录里装的是 ${present}，但请求的是 ${VERSION}。`
+          + `请删掉该目录重跑，或换一个 DSH_TESTKIT_DEPS：${DEPS_DIR}`,
+      );
+    }
+    console.log(`复用已安装依赖 ${present}: ${DEPS_DIR}`);
     return;
   }
-  if (existsSync(marker)) {
-    console.log(`依赖已存在，跳过安装: ${DEPS_DIR}`);
-    return;
-  }
+
   console.log(`安装集成测试依赖 ${VERSION} 到 ${DEPS_DIR} …`);
   // Windows 上 execFileSync 直接跑 npm.cmd 会 EINVAL（.cmd 需要 shell 解析）；
   // 而 stdio 不能用 'inherit'（受限环境禁止子进程继承管道）。折中：
-  // 用 shell:true + stdio:'ignore'，安装结果由 marker 检测判定。
+  // 用 shell:true + stdio:'ignore'，安装结果由版本核验判定。
   const installCommand = `npm install --no-audit --no-fund --loglevel=error ${PACKAGES.join(' ')}`;
   try {
     execSync(installCommand, { cwd: DEPS_DIR, stdio: 'ignore', shell: true });
   } catch (error) {
-    if (!existsSync(marker)) {
+    if (installedVersion() === undefined) {
       throw new Error(
         `安装集成测试依赖失败（${error?.message ?? error}）。`
           + `可手动执行：cd "${DEPS_DIR}" && ${installCommand}`,
       );
     }
   }
-  if (!existsSync(marker)) {
-    throw new Error(`安装后仍未找到 ${marker}；请手动在 ${DEPS_DIR} 执行 npm install。`);
+  const after = installedVersion();
+  if (after === undefined) {
+    throw new Error(`安装后仍未找到 testkit；请手动在 ${DEPS_DIR} 执行 npm install。`);
   }
   console.log('依赖安装完成');
 }
