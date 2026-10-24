@@ -1,0 +1,13 @@
+- insert:
+    - id: payload-guard
+      name: dsh-payload-guard
+      # config:
+      #   # 主开关。true（默认）= 413 后换本地路径占位文本并自动重试；
+      #   # false = 完全退回 DSH 原生行为：413 直接失败，图片预算仍是适配器默认的 20 MiB。
+      #   enabled: true
+      #   # 每次 413 后一次性移出「剩余未移出图片」的比例（0.05-1），默认 0.5。
+      #   offloadRatio: 0.5
+      #   # 单次最多移出多少张，默认 12。
+      #   maxOffloadPerRetry: 12
+      #   # 同一个 step 内最多自愈重试几次，默认 6。
+      #   maxRetriesPerStep: 6

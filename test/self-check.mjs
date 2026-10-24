@@ -1,0 +1,486 @@
+/**
+ * 自检脚本：不依赖 DSH 运行时，验证 payload-guard 的几条关键不变量。
+ *
+ * 直接 import 插件的**真实实现**（不是复制品），再拿 npm 全局 DSH checkout 里
+ * 已发布的 `imageOffloadProjection` 做交叉验证 —— 这是最关键的一条：插件算出
+ * 的 imageIndex 只要和内置 projection 差一位，就会把错误的图打上 offloaded
+ * 标记，或者让 projection 抛错把整个会话写坏。
+ *
+ * 跑法：node test/self-check.mjs
+ */
+
+import assert from 'node:assert/strict';
+
+import {
+  apply,
+  isPayloadTooLarge,
+  pickTargets,
+  planOffloadCount,
+  resolveConfig,
+  scanRetainedImages,
+} from '../lib/index.js';
+import { loadBuiltinProjection } from './builtin-projection.mjs';
+
+// 交叉验证用的官方 projection。本机找不到该包时跳过相关用例（而不是失败）：
+// 那是环境差异，不是插件缺陷。
+const builtin = await loadBuiltinProjection();
+const imageOffloadProjection = builtin?.imageOffloadProjection ?? null;
+
+// ------------------------------- 假会话构造 --------------------------------
+
+const makeRef = (id, bytes) => ({
+  attachmentId: `sha256:${id}`,
+  mediaType: 'image/png',
+  width: 1280,
+  height: 720,
+  bytes,
+  name: `${id}.png`,
+});
+
+const makeImage = (id, bytes) => ({ type: 'image', attachment: makeRef(id, bytes) });
+
+/**
+ * 造一个带 surface / eventAt / deriveEventMessage 的假 session。
+ *
+ * 事件结构与真实日志保持一致：`user/message` 的消息就是 `event.data` 本身，
+ * `tool/result` 的消息在 `event.data.message` 里 —— 内置 projection 依赖这个
+ * 差别来取消息，假数据必须同构，否则验证的是错的东西。
+ */
+function makeSession(entries) {
+  const events = new Map();
+  for (const [seq, kind, message] of entries) {
+    const event =
+      kind === 'user/message'
+        ? { type: kind, seq, data: message }
+        : { type: kind, seq, data: { message } };
+    events.set(seq, event);
+  }
+  return {
+    surface: { nodes: [...events.keys()].sort((a, b) => a - b) },
+    eventAt: (seq) => events.get(seq),
+    deriveEventMessage: (event) =>
+      event.type === 'user/message' ? event.data : event.data.message,
+  };
+}
+
+/** 用真实 projection 投影一次，返回被标记的图片 flags。 */
+function project(session, targets, baseSeq) {
+  const nodes = session.surface.nodes;
+  const context = {
+    nodes,
+    baseSeq,
+    // 官方 projection 用 events[seq - baseSeq] 直接索引，必须按 seq 对齐。
+    events: nodes.map((seq) => session.eventAt(seq)),
+    messages: new Map(),
+  };
+  return imageOffloadProjection.project({ type: 'image/offload', data: { targets } }, context);
+}
+
+// -------------------------------- 用例 ------------------------------------
+
+let passed = 0;
+let skipped = 0;
+const check = (label, fn) => {
+  fn();
+  passed += 1;
+  console.log(`  \u2713 ${label}`);
+};
+
+/** 依赖内置 projection 的用例：本机没有该包时明确跳过。 */
+const checkWithBuiltin = (label, fn) => {
+  if (imageOffloadProjection === null) {
+    skipped += 1;
+    console.log(`  \u25cb ${label}（跳过：本机未找到 @deepseek-ai/dsh）`);
+    return;
+  }
+  check(label, fn);
+};
+
+console.log('payload-guard 自检\n');
+if (imageOffloadProjection === null) {
+  console.log('  注意：未找到官方 DSH 安装，交叉验证用例将跳过\n');
+} else {
+  console.log(`  交叉验证目标: ${builtin.url}\n`);
+}
+
+check('scan 跳过已 offload，索引仍连续计数', () => {
+  const msg = {
+    content: [
+      { type: 'text', text: 'hello' },
+      makeImage('a', 100), // index 0
+      { type: 'image', attachment: makeRef('b', 200), offloaded: true }, // index 1
+      makeImage('c', 300), // index 2
+    ],
+  };
+  const session = makeSession([[10, 'user/message', msg]]);
+  const found = scanRetainedImages(session);
+  assert.deepEqual(found.map((entry) => entry.imageIndex), [0, 2]);
+  assert.deepEqual(found.map((entry) => entry.bytes), [100, 300]);
+});
+
+check('跨消息按日志顺序累积，最老的在前', () => {
+  const session = makeSession([
+    [10, 'user/message', { content: [makeImage('old1', 10), makeImage('old2', 20)] }],
+    [11, 'tool/result', { content: [makeImage('mid', 30)] }],
+    [12, 'user/message', { content: [makeImage('new', 40)] }],
+  ]);
+  const found = scanRetainedImages(session);
+  assert.deepEqual(found.map((entry) => entry.seq), [10, 10, 11, 12]);
+  assert.deepEqual(found.map((entry) => entry.imageIndex), [0, 1, 0, 0]);
+});
+
+checkWithBuiltin('与内置 projection 交叉验证：targets 精确标记目标图', () => {
+  const s1 = {
+    content: [
+      makeImage('a', 1), // 0
+      { type: 'text', text: 't' },
+      makeImage('b', 2), // 1
+      makeImage('c', 3), // 2
+    ],
+  };
+  const s2 = { content: [makeImage('d', 4), makeImage('e', 5)] };
+  const session = makeSession([
+    [100, 'user/message', s1],
+    [101, 'tool/result', s2],
+  ]);
+
+  const retained = scanRetainedImages(session);
+  assert.equal(retained.length, 5);
+  assert.deepEqual(retained.map((entry) => [entry.seq, entry.imageIndex]), [
+    [100, 0], [100, 1], [100, 2], [101, 0], [101, 1],
+  ]);
+
+  // 挑最老 3 张 → 全在 seq 100
+  const targets = pickTargets(retained, 3);
+  assert.deepEqual(targets, [{ seq: 100, imageIndexes: [0, 1, 2] }]);
+
+  const projected = project(session, targets, 100);
+  const out = projected.get(100);
+  assert.ok(out, 'projection 必须返回 seq 100 的投影消息');
+  const images = out.content.filter((block) => block.type === 'image');
+  assert.equal(images.length, 3, '图片数量不应改变');
+  assert.deepEqual(images.map((block) => block.offloaded === true), [true, true, true]);
+  assert.ok(!projected.has(101), '未选中的 seq 不应产生投影');
+});
+
+checkWithBuiltin('与内置 projection 交叉验证：跨 seq 部分选中', () => {
+  const s1 = { content: [makeImage('a', 1), makeImage('b', 2)] };
+  const s2 = { content: [makeImage('c', 3), makeImage('d', 4)] };
+  const session = makeSession([
+    [200, 'user/message', s1],
+    [201, 'tool/result', s2],
+  ]);
+
+  const retained = scanRetainedImages(session);
+  // 挑最老 3 张 → seq200 的 0,1 + seq201 的 0
+  const targets = pickTargets(retained, 3);
+  assert.deepEqual(targets, [
+    { seq: 200, imageIndexes: [0, 1] },
+    { seq: 201, imageIndexes: [0] },
+  ]);
+
+  const projected = project(session, targets, 200);
+  const first = projected.get(200).content.filter((b) => b.type === 'image');
+  const second = projected.get(201).content.filter((b) => b.type === 'image');
+  assert.deepEqual(first.map((b) => b.offloaded === true), [true, true]);
+  assert.deepEqual(second.map((b) => b.offloaded === true), [true, false], 'seq201 只标第一张');
+});
+
+checkWithBuiltin('与内置 projection 交叉验证：已有 offload 的图上再挑，索引仍对齐', () => {
+  // 模拟第二轮：index 0 已被上一轮 offload，这一轮应挑 index 1、2
+  const msg = {
+    content: [
+      { type: 'image', attachment: makeRef('a', 1), offloaded: true }, // 0 已移出
+      makeImage('b', 2), // 1
+      makeImage('c', 3), // 2
+    ],
+  };
+  const session = makeSession([[300, 'user/message', msg]]);
+  const retained = scanRetainedImages(session);
+  assert.deepEqual(retained.map((entry) => entry.imageIndex), [1, 2]);
+
+  const targets = pickTargets(retained, 2);
+  assert.deepEqual(targets, [{ seq: 300, imageIndexes: [1, 2] }]);
+
+  const projected = project(session, targets, 300);
+  const images = projected.get(300).content.filter((b) => b.type === 'image');
+  assert.equal(images.length, 3);
+  assert.deepEqual(
+    images.map((b) => b.offloaded === true),
+    [true, true, true],
+    '三张最终都已 offload',
+  );
+});
+
+check('渐进收敛：24 张图在重试上限内全部移出', () => {
+  const config = { offloadRatio: 0.5, maxOffloadPerRetry: 12, maxRetriesPerStep: 6 };
+  let remaining = 24;
+  const trace = [];
+  let guard = 0;
+  while (remaining > 0 && guard < 32) {
+    const count = planOffloadCount(remaining, config);
+    assert.ok(count >= 1, '每轮至少推进 1 张');
+    assert.ok(count <= remaining, '不能移出超过剩余数量');
+    remaining -= count;
+    trace.push(count);
+    guard += 1;
+  }
+  console.log(`      收敛轨迹: 24 -> ${trace.join(' -> ')} -> 0`);
+  assert.equal(remaining, 0);
+  assert.ok(trace.length <= config.maxRetriesPerStep, '应在重试上限内收敛完');
+});
+
+check('planOffloadCount 边界', () => {
+  const config = { offloadRatio: 0.5, maxOffloadPerRetry: 12, maxRetriesPerStep: 6 };
+  assert.equal(planOffloadCount(0, config), 0);
+  assert.equal(planOffloadCount(1, config), 1, '单张也要能推进');
+  assert.equal(planOffloadCount(2, config), 1);
+  assert.equal(planOffloadCount(100, config), 12, '受 maxOffloadPerRetry 约束');
+});
+
+check('413 识别：各种上游措辞都命中', () => {
+  const cases = [
+    { message: '413: {"message":"Request payload is too large","type":"invalid_request_error"}', code: 'INVALID_REQUEST' },
+    { message: 'payload too large', code: 'INVALID_REQUEST' },
+    { message: 'Request entity too large', code: 'INVALID_REQUEST' },
+    { message: 'request body too large', code: 'INVALID_REQUEST' },
+    { message: 'failed to buffer the request body: length limit exceeded', code: 'INVALID_REQUEST' },
+    { message: 'HTTP 413', code: 'UNKNOWN' },
+    { message: 'something odd', code: 'INVALID_REQUEST' },
+  ];
+  for (const failure of cases) {
+    assert.equal(isPayloadTooLarge(failure), true, `应命中: ${failure.message}`);
+  }
+});
+
+check('413 识别：不误伤上下文窗口超限与其他错误', () => {
+  const cases = [
+    { message: 'context window exceeded', code: 'CONTEXT_WINDOW_EXCEEDED' },
+    { message: 'This model maximum context length is 128000 tokens', code: 'CONTEXT_WINDOW_EXCEEDED' },
+    { message: 'too many tokens', code: 'INVALID_REQUEST' },
+    { message: 'rate limit', code: 'RATE_LIMIT' },
+    { message: 'Connection error.', code: 'TRANSPORT' },
+    { message: 'pi-ai stream idle timeout after 300000ms', code: 'TIMEOUT' },
+  ];
+  for (const failure of cases) {
+    assert.equal(isPayloadTooLarge(failure), false, `不应命中: ${failure.message}`);
+  }
+  assert.equal(isPayloadTooLarge(undefined), false);
+  assert.equal(isPayloadTooLarge(null), false);
+});
+
+check('幂等：已 offload 的图不会被二次选中', () => {
+  const msg = {
+    content: [
+      { type: 'image', attachment: makeRef('x', 1), offloaded: true },
+      makeImage('y', 2),
+    ],
+  };
+  const session = makeSession([[400, 'user/message', msg]]);
+  const found = scanRetainedImages(session);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].imageIndex, 1);
+});
+
+check('空会话 / 无图会话安全返回', () => {
+  assert.deepEqual(scanRetainedImages(makeSession([])), []);
+  const noImages = makeSession([
+    [500, 'user/message', { content: [{ type: 'text', text: '纯文本' }] }],
+    [501, 'tool/result', { content: [{ type: 'text', text: '结果' }] }],
+  ]);
+  assert.deepEqual(scanRetainedImages(noImages), []);
+  assert.deepEqual(pickTargets([], 5), []);
+});
+
+// ---------------------------- 主开关（enabled）-----------------------------
+
+/** 造一个只记录挂载行为的假 ctx。 */
+function makeFakeCtx(projections = []) {
+  const listeners = [];
+  const registered = [];
+  const logs = [];
+  return {
+    listeners,
+    registered,
+    logs,
+    sessions: {
+      messageProjections: projections,
+      registerMessageProjection: (projection) => {
+        registered.push(projection);
+        return () => {};
+      },
+    },
+    logger: {
+      info: (message) => logs.push(['info', message]),
+      warn: (message) => logs.push(['warn', message]),
+    },
+    on: (eventName, handler) => {
+      listeners.push([eventName, handler]);
+      return () => {};
+    },
+  };
+}
+
+check('enabled 默认开启', () => {
+  assert.equal(resolveConfig({}).enabled, true);
+  assert.equal(resolveConfig(undefined).enabled, true);
+  assert.equal(resolveConfig({ enabled: true }).enabled, true);
+  assert.equal(resolveConfig({ enabled: 'true' }).enabled, true, '非 false 的真值都算开');
+});
+
+check('enabled=false：不挂任何监听、不注册解释器（完全等于没装）', () => {
+  const fake = makeFakeCtx();
+  apply(fake, { enabled: false });
+  assert.equal(fake.listeners.length, 0, '不应挂 agent/request-error 监听');
+  assert.equal(fake.registered.length, 0, '不应注册任何投影');
+  assert.ok(
+    fake.logs.some(([, message]) => /enabled=false/u.test(message)),
+    '应留下停用日志便于排查',
+  );
+});
+
+check('enabled=true：挂上 413 监听', () => {
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, {});
+  assert.equal(fake.listeners.length, 1);
+  assert.equal(fake.listeners[0][0], 'agent/request-error');
+});
+
+check('内置解释器已存在时不重复注册（避免 "已注册" 启动崩溃）', () => {
+  const builtin = { type: 'image/offload', project: () => {} };
+  const fake = makeFakeCtx([builtin]);
+  apply(fake, {});
+  assert.equal(fake.registered.length, 0, '内置已在，插件不该再注册');
+});
+
+check('内置解释器缺席时才注册等价兜底', () => {
+  const fake = makeFakeCtx([]); // 空 projections，模拟没有 image-offload 插件
+  apply(fake, {});
+  assert.equal(fake.registered.length, 1, '应注册一份兜底');
+  assert.equal(fake.registered[0].type, 'image/offload');
+});
+
+// 端到端：用假 agent 走一遍 413 处理路径，验证真的写入 image/offload 并返回 retry。
+//
+// 注意：重试计数按 agent 实例存在 WeakMap 里，所以同一轮对话必须复用同一个
+// agent 对象 —— 这正好和真实运行时一致（一个会话一个 agent）。
+function makeAgent(session, appended) {
+  return {
+    session: {
+      ...session,
+      append: (type, data) => {
+        appended.push({ type, data });
+        return { seq: 999 };
+      },
+    },
+  };
+}
+
+function runHandler(fake, { failure, agent, turn = 1, step = 1 }) {
+  const handler = fake.listeners.find(([eventName]) => eventName === 'agent/request-error')?.[1];
+  assert.ok(handler, 'handler 必须存在');
+  return handler({ agent, turn, step, failure, signal: { aborted: false } }, () => 'NEXT');
+}
+
+check('端到端：413 触发 → 写入 image/offload → 返回 retry', () => {
+  const image = makeImage('a', 1024);
+  const session = makeSession([[10, 'user/message', { content: [image] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, {});
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+  const outcome = runHandler(fake, {
+    failure: { message: '413: {"message":"Request payload is too large"}', code: 'INVALID_REQUEST' },
+    agent,
+  });
+  assert.deepEqual(outcome, { kind: 'retry' }, '应要求重试');
+  assert.equal(appended.length, 1);
+  assert.equal(appended[0].type, 'image/offload');
+  assert.deepEqual(appended[0].data.targets, [{ seq: 10, imageIndexes: [0] }]);
+});
+
+check('端到端：非 413 错误原样放行，不写事件', () => {
+  const image = makeImage('a', 1024);
+  const session = makeSession([[10, 'user/message', { content: [image] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, {});
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+  for (const failure of [
+    { message: 'Connection error.', code: 'TRANSPORT' },
+    { message: 'rate limit exceeded', code: 'RATE_LIMIT' },
+    { message: 'context window exceeded', code: 'CONTEXT_WINDOW_EXCEEDED' },
+  ]) {
+    const outcome = runHandler(fake, { failure, agent });
+    assert.equal(outcome, 'NEXT', `${failure.code} 应交回下游`);
+    assert.equal(appended.length, 0, `${failure.code} 不该写 offload`);
+  }
+});
+
+check('端到端：enabled=false 时 413 也原样失败（回到默认行为）', () => {
+  const image = makeImage('a', 1024);
+  const session = makeSession([[10, 'user/message', { content: [image] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, { enabled: false });
+
+  // 没挂监听 → 没有 handler；等价于框架里根本没这个恢复点。
+  const handler = fake.listeners.find(([eventName]) => eventName === 'agent/request-error');
+  assert.equal(handler, undefined, 'enabled=false 不应挂监听，413 直接按原生失败');
+});
+
+check('端到端：无图可移时放行并 warn（纯文本撑爆的场景）', () => {
+  const session = makeSession([
+    [10, 'user/message', { content: [{ type: 'text', text: '很长很长的纯文本' }] }],
+  ]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, {});
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+  const outcome = runHandler(fake, {
+    failure: { message: 'payload too large', code: 'INVALID_REQUEST' },
+    agent,
+  });
+  assert.equal(outcome, 'NEXT');
+  assert.equal(appended.length, 0, '没图可移，不该写空 offload');
+  assert.ok(
+    fake.logs.some(([level]) => level === 'warn'),
+    '应 warn 说明这类体积问题本插件帮不上忙',
+  );
+});
+
+check('端到端：重试次数耗尽后放行（防止和上游无限转圈）', () => {
+  const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, { maxRetriesPerStep: 2 });
+
+  const appended = [];
+  const agent = makeAgent(session, appended); // 同一 agent = 同一轮对话
+  const failure = { message: 'payload too large', code: 'INVALID_REQUEST' };
+
+  assert.deepEqual(runHandler(fake, { failure, agent }), { kind: 'retry' }, '第 1 次应重试');
+  assert.deepEqual(runHandler(fake, { failure, agent }), { kind: 'retry' }, '第 2 次仍重试');
+  assert.equal(runHandler(fake, { failure, agent }), 'NEXT', '第 3 次超限后交回原错误');
+});
+
+check('端到端：换了 step 计数重置（不会跨 step 泄漏）', () => {
+  const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, { maxRetriesPerStep: 1 });
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+  const failure = { message: 'payload too large', code: 'INVALID_REQUEST' };
+
+  assert.deepEqual(runHandler(fake, { failure, agent, step: 1 }), { kind: 'retry' });
+  assert.equal(runHandler(fake, { failure, agent, step: 1 }), 'NEXT', '同 step 超限');
+  assert.deepEqual(
+    runHandler(fake, { failure, agent, step: 2 }),
+    { kind: 'retry' },
+    '新 step 应重新计数',
+  );
+});
+
+console.log(`\n全部 ${passed} 组用例通过`);

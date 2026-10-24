@@ -1,0 +1,48 @@
+{
+  "name": "dsh-payload-guard",
+  "version": "0.1.0",
+  "description": "DSH plugin: recover from 413 Request payload too large by replacing context images with local-path placeholders and retrying",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "XiAzir",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XiAzir/dsh-payload-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/XiAzir/dsh-payload-guard/issues"
+  },
+  "homepage": "https://github.com/XiAzir/dsh-payload-guard#readme",
+  "scripts": {
+    "test": "node test/self-check.mjs",
+    "test:dryrun": "node test/dead-session-dryrun.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "deepseek-harness",
+    "payload",
+    "413",
+    "image-offload",
+    "payload-too-large"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
