@@ -297,6 +297,35 @@ check('413 识别：与 HTTP body 无关的 length limit 不得误判', () => {
   );
 });
 
+check('413 识别：已知 HTTP 状态码否决文本匹配（P0 安全边界）', () => {
+  // 适配器填了 status 就是权威信息。否则消息里恰好出现的 "413" 字样会让
+  // 已知 400/500 的请求被误判，触发不可逆的历史改写。
+  const mustNot = [
+    { status: 400, code: 'INVALID_REQUEST', message: 'HTTP 400: invalid field value "413"' },
+    { status: 400, code: 'INVALID_REQUEST', message: 'bad request: payload too large param name' },
+    { status: 500, code: 'SERVER', message: 'upstream 413 proxy error' },
+    { status: 401, code: 'AUTH', message: 'request_too_large mentioned in auth docs' },
+    { status: 429, code: 'RATE_LIMIT', message: 'retry after 413 ms' },
+  ];
+  for (const failure of mustNot) {
+    assert.equal(
+      isPayloadTooLarge(failure),
+      false,
+      `status 非 413 时必须否决: ${failure.message}`,
+    );
+  }
+  // status === 413 时即使文本毫无线索也必须命中。
+  assert.equal(
+    isPayloadTooLarge({ status: 413, code: 'INVALID_REQUEST', message: 'whatever' }),
+    true,
+  );
+  // 没给 status 时仍走文本识别（pi-ai 主路径）。
+  assert.equal(
+    isPayloadTooLarge({ code: 'INVALID_REQUEST', message: '413: Request payload is too large' }),
+    true,
+  );
+});
+
 check('413 识别：不误伤上下文窗口超限与其他错误', () => {
   const cases = [
     { message: 'context window exceeded', code: 'CONTEXT_WINDOW_EXCEEDED' },
@@ -613,6 +642,10 @@ check('动态提示：未卸载时为空串，卸载后返回固定文本', () =
   assert.ok(text.length > 0, '卸载后应有提示');
   assert.ok(/一次只回读一张/u.test(text), '应包含「一次只读一张」的引导');
   assert.ok(/read_image/u.test(text), '应提到回读工具');
+  // 不得错误归因：提示的激活状态也可能从官方主动卸载的事件重建，那时原因不是 413。
+  assert.ok(!/网关上限|payload too large|413/u.test(text), '不得把原因归给网关超限');
+  // 不得承诺一定能回读：拿不到可读路径时占位符只给附件身份。
+  assert.ok(/不能保证能够重新读取/u.test(text), '应保留「不保证可回读」的限定');
   // 固定文本：不含任何可变数字，避免每次变化都追加一份新快照
   assert.ok(!/\d+\s*张/u.test(text), '不得包含可变计数（会导致快照堆积）');
 
@@ -653,9 +686,11 @@ check('动态提示：恢复/fork 场景能从历史 image/offload 事件重建�
   const entry = contexts[0];
 
   // 构造一个「历史里已有 image/offload，但本进程从未处理过 413」的会话。
+  // targets 用**合法**形状（非空、seq 是 surface 节点）：官方 projection 会拒绝
+  // 空 targets，用非法样本只能测到「扫到了事件类型」，证明不了真实历史可重放。
   const events = new Map([
     [0, { type: 'user/message', seq: 0 }],
-    [1, { type: 'image/offload', seq: 1, data: { targets: [] } }],
+    [1, { type: 'image/offload', seq: 1, data: { targets: [{ seq: 0, imageIndexes: [0] }] } }],
     [2, { type: 'assistant/message', seq: 2 }],
   ]);
   const restoredSession = {
@@ -667,6 +702,9 @@ check('动态提示：恢复/fork 场景能从历史 image/offload 事件重建�
   const text = entry.text({ agent: restoredAgent });
   assert.ok(text.length > 0, '应能从历史事件重建出提示，而不是返回空串');
   assert.ok(/一次只回读一张/u.test(text));
+
+  // 二次调用应命中缓存并保持一致。
+  assert.equal(entry.text({ agent: restoredAgent }), text, '重复求值必须稳定');
 });
 
 check('动态提示：历史里没有 offload 事件时仍为空串', () => {
