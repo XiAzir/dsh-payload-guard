@@ -240,16 +240,37 @@ check('planOffloadCount 边界', () => {
 
 check('413 识别：各种上游措辞都命中', () => {
   const cases = [
+    // pi-ai 的真实失败对象：只有 message + code，没有 status。这是主路径。
     { message: '413: {"message":"Request payload is too large","type":"invalid_request_error"}', code: 'INVALID_REQUEST' },
     { message: 'payload too large', code: 'INVALID_REQUEST' },
     { message: 'Request entity too large', code: 'INVALID_REQUEST' },
     { message: 'request body too large', code: 'INVALID_REQUEST' },
     { message: 'failed to buffer the request body: length limit exceeded', code: 'INVALID_REQUEST' },
     { message: 'HTTP 413', code: 'UNKNOWN' },
-    { message: 'something odd', code: 'INVALID_REQUEST' },
+    { message: '{"error":{"type":"request_too_large"}}', code: 'INVALID_REQUEST' },
+    // 硬证据：部分适配器（如 dsh-llm-deepseek）会填 status。
+    { message: 'something terse', code: 'INVALID_REQUEST', status: 413 },
   ];
   for (const failure of cases) {
     assert.equal(isPayloadTooLarge(failure), true, `应命中: ${failure.message}`);
+  }
+});
+
+check('413 识别：裸 INVALID_REQUEST 不再触发（P0 安全边界）', () => {
+  // 这是本插件最重要的安全边界：pi-ai 把 400 和 413 都归成 INVALID_REQUEST，
+  // 若退回 code 判断，参数错误也会触发**持久化**图片卸载。宁可漏判不能误判。
+  const mustNot = [
+    { message: 'something odd', code: 'INVALID_REQUEST' },
+    { message: 'Invalid request parameters', code: 'INVALID_REQUEST' },
+    { message: 'unsupported parameter temperature', code: 'INVALID_REQUEST' },
+    { message: 'messages.3.content.2.image.source.base64.data: Image does not match the provided media type', code: 'INVALID_REQUEST' },
+  ];
+  for (const failure of mustNot) {
+    assert.equal(
+      isPayloadTooLarge(failure),
+      false,
+      `绝不能命中（会误删图片）: ${failure.message}`,
+    );
   }
 });
 
@@ -261,6 +282,9 @@ check('413 识别：不误伤上下文窗口超限与其他错误', () => {
     { message: 'rate limit', code: 'RATE_LIMIT' },
     { message: 'Connection error.', code: 'TRANSPORT' },
     { message: 'pi-ai stream idle timeout after 300000ms', code: 'TIMEOUT' },
+    // 其它 HTTP 状态码不应被误认为 413。
+    { message: 'bad request', code: 'INVALID_REQUEST', status: 400 },
+    { message: 'server error', code: 'SERVER', status: 500 },
   ];
   for (const failure of cases) {
     assert.equal(isPayloadTooLarge(failure), false, `不应命中: ${failure.message}`);
@@ -346,18 +370,24 @@ check('enabled=true：挂上 413 监听', () => {
   assert.equal(fake.listeners[0][0], 'agent/request-error');
 });
 
-check('内置解释器已存在时不重复注册（避免 "已注册" 启动崩溃）', () => {
-  const builtin = { type: 'image/offload', project: () => {} };
-  const fake = makeFakeCtx([builtin]);
-  apply(fake, {});
-  assert.equal(fake.registered.length, 0, '内置已在，插件不该再注册');
-});
+// ------------------- 解释器缺席时的 fail-closed 行为 ----------------------
 
-check('内置解释器缺席时才注册等价兜底', () => {
+check('内置解释器缺席：不注册兜底，且不挂监听（fail-closed）', () => {
   const fake = makeFakeCtx([]); // 空 projections，模拟没有 image-offload 插件
   apply(fake, {});
-  assert.equal(fake.registered.length, 1, '应注册一份兜底');
-  assert.equal(fake.registered[0].type, 'image/offload');
+  assert.equal(fake.registered.length, 0, '绝不能抢注解释器（会让官方插件抛 already registered）');
+  assert.equal(fake.listeners.length, 0, '没有解释器就别挂监听：写了也解释不了，不该假装能工作');
+  assert.ok(
+    fake.logs.some(([, message]) => /未检测到 image\/offload 解释器/u.test(message)),
+    '应留下明确 warn，说明为何不工作',
+  );
+});
+
+check('内置解释器存在：正常挂监听、不重复注册', () => {
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, {});
+  assert.equal(fake.registered.length, 0, '内置已在，插件不该再注册');
+  assert.equal(fake.listeners.length, 1);
 });
 
 // 端到端：用假 agent 走一遍 413 处理路径，验证真的写入 image/offload 并返回 retry。
@@ -451,10 +481,10 @@ check('端到端：无图可移时放行并 warn（纯文本撑爆的场景）',
   );
 });
 
-check('端到端：重试次数耗尽后放行（防止和上游无限转圈）', () => {
+check('端到端：本回合恢复次数耗尽后放行（防止和上游无限转圈）', () => {
   const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
   const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
-  apply(fake, { maxRetriesPerStep: 2 });
+  apply(fake, { maxRecoveriesPerTurn: 2 });
 
   const appended = [];
   const agent = makeAgent(session, appended); // 同一 agent = 同一轮对话
@@ -462,25 +492,123 @@ check('端到端：重试次数耗尽后放行（防止和上游无限转圈）'
 
   assert.deepEqual(runHandler(fake, { failure, agent }), { kind: 'retry' }, '第 1 次应重试');
   assert.deepEqual(runHandler(fake, { failure, agent }), { kind: 'retry' }, '第 2 次仍重试');
-  assert.equal(runHandler(fake, { failure, agent }), 'NEXT', '第 3 次超限后交回原错误');
+  assert.equal(runHandler(fake, { failure, agent }), 'NEXT', '第 3 次超预算后交回原错误');
 });
 
-check('端到端：换了 step 计数重置（不会跨 step 泄漏）', () => {
+check('端到端：跨 step 不重置预算（P0 关键：堵住回读循环）', () => {
   const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
   const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
-  apply(fake, { maxRetriesPerStep: 1 });
+  apply(fake, { maxRecoveriesPerTurn: 2 });
 
   const appended = [];
   const agent = makeAgent(session, appended);
   const failure = { message: 'payload too large', code: 'INVALID_REQUEST' };
 
+  // 同一 turn 内换 step —— 旧实现按 `${turn}/${step}` 计数，这里会重新计满，
+  // 从而使「回读 → 超限 → 再卸载」的跨 step 循环完全不受限。
   assert.deepEqual(runHandler(fake, { failure, agent, step: 1 }), { kind: 'retry' });
-  assert.equal(runHandler(fake, { failure, agent, step: 1 }), 'NEXT', '同 step 超限');
-  assert.deepEqual(
-    runHandler(fake, { failure, agent, step: 2 }),
-    { kind: 'retry' },
-    '新 step 应重新计数',
+  assert.deepEqual(runHandler(fake, { failure, agent, step: 2 }), { kind: 'retry' });
+  assert.equal(
+    runHandler(fake, { failure, agent, step: 3 }),
+    'NEXT',
+    '同一回合换 step 不得重置预算',
   );
+});
+
+check('端到端：进入新回合后预算重置', () => {
+  const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, { maxRecoveriesPerTurn: 1 });
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+  const failure = { message: 'payload too large', code: 'INVALID_REQUEST' };
+
+  assert.deepEqual(runHandler(fake, { failure, agent, turn: 1 }), { kind: 'retry' });
+  assert.equal(runHandler(fake, { failure, agent, turn: 1 }), 'NEXT', '同一回合超预算');
+  assert.deepEqual(
+    runHandler(fake, { failure, agent, turn: 2 }),
+    { kind: 'retry' },
+    '新回合应重新获得预算',
+  );
+});
+
+check('端到端：参数错误（裸 INVALID_REQUEST）绝不写 offload', () => {
+  const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  apply(fake, {});
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+
+  // 这是发布前必过的安全回归：误判会造成**不可逆**的图片卸载。
+  for (const failure of [
+    { message: 'Invalid request parameters', code: 'INVALID_REQUEST' },
+    { message: 'unsupported parameter: temperature', code: 'INVALID_REQUEST' },
+    { message: 'Image does not match the provided media type image/jpeg', code: 'INVALID_REQUEST' },
+  ]) {
+    assert.equal(runHandler(fake, { failure, agent }), 'NEXT', '应交回下游');
+  }
+  assert.equal(appended.length, 0, '一次 offload 都不该写');
+});
+
+check('动态提示：未卸载时为空串，卸载后返回固定文本', () => {
+  const session = makeSession([[10, 'user/message', { content: [makeImage('a', 1024)] }]]);
+  const contexts = [];
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  // 补上 systemPrompt 服务，让 ctx.inject 能跑起来
+  fake.systemPrompt = {
+    context: (entry) => {
+      contexts.push(entry);
+      return () => {};
+    },
+    getContextOrder: () => 9000,
+  };
+  fake.inject = (deps, fn) => {
+    fake.injected = deps;
+    fn(fake);
+  };
+  apply(fake, {});
+
+  assert.deepEqual(fake.injected, ['systemPrompt'], '应向 systemPrompt 注入');
+  assert.equal(contexts.length, 1, '应注册一个 context 贡献');
+  const entry = contexts[0];
+  assert.equal(typeof entry.text, 'function', 'text 应为函数以便动态求值');
+
+  const appended = [];
+  const agent = makeAgent(session, appended);
+
+  // 卸载前：空串（DSH 不会为空文本新增快照）
+  assert.equal(entry.text({ agent }), '', '未发生卸载时必须是空串');
+
+  runHandler(fake, {
+    failure: { message: 'payload too large', code: 'INVALID_REQUEST' },
+    agent,
+  });
+
+  const text = entry.text({ agent });
+  assert.ok(text.length > 0, '卸载后应有提示');
+  assert.ok(/一次只回读一张/u.test(text), '应包含「一次只读一张」的引导');
+  assert.ok(/read_image/u.test(text), '应提到回读工具');
+  // 固定文本：不含任何可变数字，避免每次变化都追加一份新快照
+  assert.ok(!/\d+\s*张/u.test(text), '不得包含可变计数（会导致快照堆积）');
+
+  // 再次调用必须逐字一致 —— 否则每次都会追加新快照
+  assert.equal(entry.text({ agent }), text, '文本必须稳定');
+});
+
+check('动态提示：notice=false 时不注册 context', () => {
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  fake.systemPrompt = { context: () => () => {}, getContextOrder: () => 9000 };
+  fake.inject = (deps, fn) => fn(fake);
+  const contexts = [];
+  fake.systemPrompt.context = (entry) => {
+    contexts.push(entry);
+    return () => {};
+  };
+  apply(fake, { notice: false });
+  assert.equal(contexts.length, 0, 'notice=false 时不应注册提示');
+  assert.equal(fake.listeners.length, 1, '但 413 监听仍应挂上');
 });
 
 console.log(`\n全部 ${passed} 组用例通过`);

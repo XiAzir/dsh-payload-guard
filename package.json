@@ -1,7 +1,7 @@
 {
   "name": "dsh-payload-guard",
-  "version": "0.1.0",
-  "description": "DSH plugin: recover from 413 Request payload too large by replacing context images with local-path placeholders and retrying",
+  "version": "0.1.1",
+  "description": "DSH plugin: recover from HTTP 413 payload-too-large by replacing context images with local-path placeholders and retrying",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
