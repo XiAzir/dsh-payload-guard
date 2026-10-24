@@ -193,14 +193,10 @@ payload-guard** 才能启用恢复。这是「初始化时检测一次」的固�
 ```bash
 node test/self-check.mjs              # 31 组离线自检项；部分官方 projection 交叉验证在依赖缺失时跳过
 node test/dead-session-dryrun.mjs     # 用真实会话日志干跑
+node test/integration/run.mjs         # 真实 Agent Loop 集成测试（自动装隔离依赖）
 ```
 
-> **关于 dry-run 的证据边界**：`dead-session-dryrun.mjs` 中的图片体积统计来自附件元数据
-> `attachment.bytes`，**并非**适配器完成缩放、重新编码以及 Base64 序列化后的实际 HTTP
-> 请求体大小。干跑主要验证卸载目标的选择、官方 projection 的接受情况与收敛轨迹，
-> **不代表已通过真实网关请求测试**。
-
-覆盖要点：
+### 离线用例覆盖
 
 - imageIndex 语义与**真实内置 projection 的交叉验证**（差一位就会标错图或让 projection 抛错）
 - **裸 `INVALID_REQUEST` 绝不触发卸载**（发布前必过的安全边界；误判会造成不可逆破坏）
@@ -209,7 +205,43 @@ node test/dead-session-dryrun.mjs     # 用真实会话日志干跑
 - 跨 step 不重置预算、新回合重置预算
 - fail-closed：解释器缺席时不抢注、不挂监听
 - 动态提示：未卸载时为空串、卸载后为固定文本（不含可变计数）、恢复/fork 后可从历史重建
+- **历史扫描是真增量**：无新增事件时 `eventAt()` 调用次数必须为 0
 - 渐进收敛轨迹、413 措辞识别与反例、无图会话、enabled 开关
+
+### 真实 Agent Loop 集成测试
+
+`test/integration/` 用**已发布的 npm 包**（`@deepseek-ai/dsh-agent-loop-testkit` 等）
+装配真实运行时，验证离线假件证明不了的三件事：
+
+| 场景 | 断言 |
+|---|---|
+| HTTP 400 | 会话日志中**没有**任何 `image/offload` 事件 |
+| HTTP 413 | 真的写入 `image/offload`、真的重发请求、后续请求的图片块被官方投影标记 `offloaded` |
+| 历史重建 | `offload` 事件落在真实 Session 日志里，回扫能定位到 |
+
+装配的是真实 `Context` / `SessionStore` / 官方 `image-offload` projection / `AgentLoop`，
+只有 `LlmAdapter` 是脚本化的（不访问任何上游）。
+
+**插件仓库保持零 DSH 运行时依赖**：这些包装在仓库外的隔离临时目录
+（默认 `<tmp>/dsh-payload-guard-itest`），首次运行自动安装并锁定版本。
+
+可通过环境变量控制：
+
+| 变量 | 作用 |
+|---|---|
+| `DSH_TESTKIT_DEPS` | 指定隔离依赖目录 |
+| `DSH_TESTKIT_VERSION` | 锁定 DSH 版本（默认 `0.2.1-rc.2`） |
+| `SKIP_INSTALL=1` | 复用已装依赖，跳过安装 |
+
+> 版本要与你实际部署的 DSH 对齐。集成测试验证的是**发行包之间的兼容性**，
+> 这比跟着源码主分支更贴近真实部署环境。
+
+### dry-run 的证据边界
+
+> `dead-session-dryrun.mjs` 中的图片体积统计来自附件元数据 `attachment.bytes`，
+> **并非**适配器完成缩放、重新编码以及 Base64 序列化后的实际 HTTP 请求体大小。
+> 干跑主要验证卸载目标的选择、官方 projection 的接受情况与收敛轨迹，
+> **不代表已通过真实网关请求测试**。
 
 ## License
 

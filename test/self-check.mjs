@@ -728,4 +728,62 @@ check('动态提示：历史里没有 offload 事件时仍为空串', () => {
   assert.equal(contexts[0].text({ agent: cleanAgent }), '', '干净会话必须是空串');
 });
 
+check('动态提示：历史扫描必须是真增量（不重复扫已检查区间）', () => {
+  // 回归用例：早期实现的 checkedUpTo 只改了循环起点，循环仍一路降到 0，
+  // 等于每次求值都全量重扫。对以超长会话为主要场景的插件，这是实打实的浪费。
+  const contexts = [];
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  fake.systemPrompt = {
+    context: (entry) => {
+      contexts.push(entry);
+      return () => {};
+    },
+    getContextOrder: () => 9000,
+  };
+  fake.inject = (deps, fn) => fn(fake);
+  apply(fake, {});
+
+  const calls = [];
+  let seqTotal = 1000;
+  const events = new Map();
+  for (let i = 0; i < 1000; i += 1) events.set(i, { type: 'user/message', seq: i });
+  const session = {
+    get seq() {
+      return seqTotal;
+    },
+    eventAt: (seq) => {
+      calls.push(seq);
+      return events.get(seq);
+    },
+  };
+  const agent = { session };
+  const entry = contexts[0];
+
+  calls.length = 0;
+  entry.text({ agent });
+  assert.equal(calls.length, 1000, '首次求值需要扫全量');
+
+  calls.length = 0;
+  entry.text({ agent });
+  assert.equal(calls.length, 0, '无新增事件时必须一次都不扫');
+
+  seqTotal = 1001;
+  events.set(1000, { type: 'user/message', seq: 1000 });
+  calls.length = 0;
+  entry.text({ agent });
+  assert.equal(calls.length, 1, '新增 1 条时只能扫这 1 条（倒序 → 先看最新的）');
+
+  // 命中 offload 之后永久短路。
+  seqTotal = 1002;
+  events.set(1001, { type: 'image/offload', seq: 1001, data: { targets: [{ seq: 1000, imageIndexes: [0] }] } });
+  calls.length = 0;
+  const text = entry.text({ agent });
+  assert.ok(text.length > 0, '命中后应激活提示');
+  assert.equal(calls.length, 1, '命中那一条时只扫 1 次');
+
+  calls.length = 0;
+  entry.text({ agent });
+  assert.equal(calls.length, 0, '已确认存在后必须短路，不再扫描');
+});
+
 console.log(`\n全部 ${passed} 组用例通过`);
