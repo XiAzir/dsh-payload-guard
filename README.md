@@ -60,8 +60,19 @@ DSH 插件：**请求体超限（HTTP 413）自愈** —— 触发后，将上�
 
 ## 安装
 
+> 本插件**尚未发布到 npm**，请从 GitHub 安装。
+
+### 方式一：从 GitHub 安装（推荐）
+
+```bash
+# 装到你 profile 的插件目录
+npm install --prefix "$HOME/.dsh/profiles/web" \
+  https://github.com/XiAzir/dsh-payload-guard/archive/refs/tags/v0.1.5.tar.gz
+```
+
+然后在 profile 的 `cordis.patch.yml` 里登记：
+
 ```yaml
-# 加到你 profile 的 cordis.patch.yml（或用 dev_inject_plugin 直接注入）
 - insert:
     - id: payload-guard
       name: dsh-payload-guard
@@ -69,10 +80,25 @@ DSH 插件：**请求体超限（HTTP 413）自愈** —— 触发后，将上�
         enabled: true
 ```
 
-或直接用 super-injector 热注入（免重启）：
+或直接克隆到本地任意位置，再热注入（免重启）：
 
 ```
-dev_inject_plugin(dir: "E:/dsh-plugins/dsh-payload-guard")
+dev_inject_plugin(dir: "<你克隆到的路径>")
+```
+
+### 方式二：直接 git clone
+
+```bash
+git clone https://github.com/XiAzir/dsh-payload-guard.git
+```
+
+```yaml
+# cordis.patch.yml
+- insert:
+    - id: payload-guard
+      name: dsh-payload-guard
+      config:
+        enabled: true
 ```
 
 > 本插件为**通用插件**，不绑定任何工作区。
@@ -80,6 +106,15 @@ dev_inject_plugin(dir: "E:/dsh-plugins/dsh-payload-guard")
 **前置依赖**：内置 `@deepseek-ai/dsh-compaction-image-offload` 必须已装载 —— 它提供
 `image/offload` 事件的解释器。本插件**不抢注**该解释器；检测到它缺席时会 log 一条 warn 并
 **fail-closed**（不挂监听、不写事件），而不是假装能工作。
+
+### 版本兼容性
+
+已在 **DSH 0.2.1-rc.2** 上通过真实 Agent Loop 集成测试。DSH 版本升级后请重跑
+`npm run test:integration`（可用 `DSH_TESTKIT_VERSION=<目标版本>` 指定要验证的版本）。
+
+本插件**不做版本号硬拦截**：版本号不能可靠代表事件语义，误停用比失效更糟。若未来 DSH
+改变了 `image/offload` 的解释规则，可能出现「事件写得成功但模型看不到缩小后的请求体」
+这类隐性退化 —— 届时请以集成测试结果为准，而不是靠版本号推断。
 
 ## 配置
 
