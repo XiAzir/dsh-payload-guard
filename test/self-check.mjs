@@ -274,6 +274,29 @@ check('413 识别：裸 INVALID_REQUEST 不再触发（P0 安全边界）', () =
   }
 });
 
+check('413 识别：与 HTTP body 无关的 length limit 不得误判', () => {
+  // 裸 "length limit exceeded" 会命中这些与请求体无关的限制，
+  // 对会持久化改历史的处理器来说误判代价太高。
+  const mustNot = [
+    { message: 'message length limit exceeded 1000000 characters', code: 'INVALID_REQUEST' },
+    { message: 'context length limit exceeded', code: 'INVALID_REQUEST' },
+    { message: 'string length limit exceeded', code: 'INVALID_REQUEST' },
+    { message: 'output length limit exceeded max_tokens', code: 'INVALID_REQUEST' },
+  ];
+  for (const failure of mustNot) {
+    assert.equal(isPayloadTooLarge(failure), false, `不应命中: ${failure.message}`);
+  }
+  // 但真正的请求体缓冲失败仍应命中。
+  assert.equal(
+    isPayloadTooLarge({
+      message: 'failed to buffer the request body: length limit exceeded',
+      code: 'INVALID_REQUEST',
+    }),
+    true,
+    '请求体缓冲失败必须命中',
+  );
+});
+
 check('413 识别：不误伤上下文窗口超限与其他错误', () => {
   const cases = [
     { message: 'context window exceeded', code: 'CONTEXT_WINDOW_EXCEEDED' },
@@ -609,6 +632,62 @@ check('动态提示：notice=false 时不注册 context', () => {
   apply(fake, { notice: false });
   assert.equal(contexts.length, 0, 'notice=false 时不应注册提示');
   assert.equal(fake.listeners.length, 1, '但 413 监听仍应挂上');
+});
+
+check('动态提示：恢复/fork 场景能从历史 image/offload 事件重建激活状态', () => {
+  // 关键缺陷回归：内存 WeakMap 在「恢复持久化会话 / fork / 插件晚加载」时是空的，
+  // 但历史里的 image/offload 事件还在。若不回扫重建，图片仍处于卸载状态，
+  // 模型却收不到引导。官方 RuntimeContextProjection 正是靠回扫历史恢复状态。
+  const contexts = [];
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  fake.systemPrompt = {
+    context: (entry) => {
+      contexts.push(entry);
+      return () => {};
+    },
+    getContextOrder: () => 9000,
+  };
+  fake.inject = (deps, fn) => fn(fake);
+  apply(fake, {});
+
+  const entry = contexts[0];
+
+  // 构造一个「历史里已有 image/offload，但本进程从未处理过 413」的会话。
+  const events = new Map([
+    [0, { type: 'user/message', seq: 0 }],
+    [1, { type: 'image/offload', seq: 1, data: { targets: [] } }],
+    [2, { type: 'assistant/message', seq: 2 }],
+  ]);
+  const restoredSession = {
+    seq: 3,
+    eventAt: (seq) => events.get(seq),
+  };
+  const restoredAgent = { session: restoredSession };
+
+  const text = entry.text({ agent: restoredAgent });
+  assert.ok(text.length > 0, '应能从历史事件重建出提示，而不是返回空串');
+  assert.ok(/一次只回读一张/u.test(text));
+});
+
+check('动态提示：历史里没有 offload 事件时仍为空串', () => {
+  const contexts = [];
+  const fake = makeFakeCtx([{ type: 'image/offload', project: () => {} }]);
+  fake.systemPrompt = {
+    context: (entry) => {
+      contexts.push(entry);
+      return () => {};
+    },
+    getContextOrder: () => 9000,
+  };
+  fake.inject = (deps, fn) => fn(fake);
+  apply(fake, {});
+
+  const events = new Map([
+    [0, { type: 'user/message', seq: 0 }],
+    [1, { type: 'assistant/message', seq: 1 }],
+  ]);
+  const cleanAgent = { session: { seq: 2, eventAt: (seq) => events.get(seq) } };
+  assert.equal(contexts[0].text({ agent: cleanAgent }), '', '干净会话必须是空串');
 });
 
 console.log(`\n全部 ${passed} 组用例通过`);
